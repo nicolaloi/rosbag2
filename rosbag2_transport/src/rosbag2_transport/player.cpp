@@ -41,7 +41,6 @@
 #include "rosbag2_transport/config_options_from_node_params.hpp"
 #include "rosbag2_transport/player_service_client.hpp"
 #include "rosbag2_transport/reader_writer_factory.hpp"
-#include "rosbag2_transport/player_progress_bar.hpp"
 
 #include "logging.hpp"
 
@@ -299,6 +298,11 @@ private:
   void configure_play_until_timestamp();
   bool shall_stop_at_timestamp(const rcutils_time_point_value_t & msg_timestamp) const;
 
+  void print_status(const char status) const;
+  void print_running_status() const;
+  void print_paused_status() const;
+  void print_delayed_status() const;
+
   static constexpr double read_ahead_lower_bound_percentage_ = 0.9;
   static const std::chrono::milliseconds queue_read_wait_period_;
   std::atomic_bool cancel_wait_for_next_message_{false};
@@ -329,6 +333,8 @@ private:
   std::condition_variable playback_finished_cv_;
 
   rcutils_time_point_value_t starting_time_;
+  double starting_time_secs_;
+  double duration_secs_;
 
   // control services
   rclcpp::Service<rosbag2_interfaces::srv::Pause>::SharedPtr srv_pause_;
@@ -352,7 +358,7 @@ private:
   std::shared_ptr<PlayerServiceClientManager> player_service_client_manager_;
 
   // progress bar
-  std::unique_ptr<PlayerProgressBar> progress_bar_;
+  const bool disable_progress_bar_;
 };
 
 PlayerImpl::PlayerImpl(
@@ -365,7 +371,8 @@ PlayerImpl::PlayerImpl(
   storage_options_(storage_options),
   play_options_(play_options),
   keyboard_handler_(std::move(keyboard_handler)),
-  player_service_client_manager_(std::make_shared<PlayerServiceClientManager>())
+  player_service_client_manager_(std::make_shared<PlayerServiceClientManager>()),
+  disable_progress_bar_(play_options.disable_progress_bar)
 {
   for (auto & topic : play_options_.topics_to_filter) {
     topic = rclcpp::expand_topic_or_service_name(
@@ -412,11 +419,11 @@ PlayerImpl::PlayerImpl(
       starting_time_ += play_options_.start_offset;
       bag_duration -= play_options_.start_offset;
     }
+    starting_time_secs_ = RCUTILS_NS_TO_S(static_cast<double>(starting_time_));
+    duration_secs_ = RCUTILS_NS_TO_S(static_cast<double>(bag_duration));
     clock_ = std::make_unique<rosbag2_cpp::TimeControllerClock>(
       starting_time_, std::chrono::steady_clock::now,
       std::chrono::milliseconds{100}, play_options_.start_paused);
-    progress_bar_ = std::make_unique<PlayerProgressBar>(play_options_.disable_progress_bar,
-      starting_time_, bag_duration);
     set_rate(play_options_.rate);
     topic_qos_profile_overrides_ = play_options_.topic_qos_profile_overrides;
     prepare_publishers();
@@ -424,7 +431,13 @@ PlayerImpl::PlayerImpl(
   }
   create_control_services();
   add_keyboard_callbacks();
-  RCLCPP_INFO_STREAM(owner_->get_logger(), progress_bar_->get_help_str());
+  std::string progress_bar_help_str;
+  if (!disable_progress_bar_) {
+    progress_bar_help_str = "Bag Time and Duration [?]: ? = R running, P paused, D delayed";
+  } else {
+    progress_bar_help_str = "Bag Time and Duration progress bar disabled.";
+  }
+  RCLCPP_INFO_STREAM(owner_->get_logger(), progress_bar_help_str);
 }
 
 PlayerImpl::~PlayerImpl()
@@ -444,6 +457,11 @@ PlayerImpl::~PlayerImpl()
   std::lock_guard<std::mutex> lk(reader_mutex_);
   if (reader_) {
     reader_->close();
+  }
+  // print new line to keep on screen the latest progress bar
+  if (!disable_progress_bar_) {
+    printf("\n");
+    fflush(stdout);
   }
 }
 
@@ -495,7 +513,7 @@ bool PlayerImpl::play()
         do {
           if (delay > rclcpp::Duration(0, 0)) {
             RCLCPP_INFO_STREAM(owner_->get_logger(), "Sleep " << delay.nanoseconds() << " ns");
-            progress_bar_->print_delayed_status(clock_->now());
+            print_delayed_status();
             std::chrono::nanoseconds delay_duration(delay.nanoseconds());
             std::this_thread::sleep_for(delay_duration);
           }
@@ -613,9 +631,9 @@ void PlayerImpl::stop()
     }
   }
   if (clock_->is_paused()) {
-    progress_bar_->print_paused_status(clock_->now());
+    print_paused_status();
   } else {
-    progress_bar_->print_running_status(clock_->now());
+    print_running_status();
   }
 }
 
@@ -623,14 +641,14 @@ void PlayerImpl::pause()
 {
   clock_->pause();
   RCLCPP_INFO_STREAM(owner_->get_logger(), "Pausing play.");
-  progress_bar_->print_paused_status(clock_->now());
+  print_paused_status();
 }
 
 void PlayerImpl::resume()
 {
   clock_->resume();
   RCLCPP_INFO_STREAM(owner_->get_logger(), "Resuming play.");
-  progress_bar_->print_running_status(clock_->now());
+  print_running_status();
 }
 
 void PlayerImpl::toggle_paused()
@@ -658,9 +676,9 @@ bool PlayerImpl::set_rate(double rate)
     RCLCPP_WARN_STREAM(owner_->get_logger(), "Failed to set rate to invalid value " << rate);
   }
   if (clock_->is_paused()) {
-    progress_bar_->print_paused_status(clock_->now());
+    print_paused_status();
   } else {
-    progress_bar_->print_running_status(clock_->now());
+    print_running_status();
   }
   return ok;
 }
@@ -729,7 +747,7 @@ bool PlayerImpl::play_next()
     next_message_published = publish_message(message_ptr);
     clock_->jump(message_ptr->recv_timestamp);
 
-    progress_bar_->print_paused_status(clock_->now());
+    print_paused_status();
     message_queue_.pop();
     message_ptr = peek_next_message_from_queue();
   }
@@ -740,7 +758,7 @@ size_t PlayerImpl::burst(const size_t num_messages)
 {
   if (!clock_->is_paused()) {
     RCLCPP_WARN_STREAM(owner_->get_logger(), "Burst can only be used when in the paused state.");
-    progress_bar_->print_running_status(clock_->now());
+    print_running_status();
     return 0;
   }
 
@@ -755,7 +773,7 @@ size_t PlayerImpl::burst(const size_t num_messages)
   }
 
   RCLCPP_INFO_STREAM(owner_->get_logger(), "Burst " << messages_played << " messages.");
-  progress_bar_->print_running_status(clock_->now());
+  print_running_status();
   return messages_played;
 }
 
@@ -981,7 +999,7 @@ void PlayerImpl::play_messages_from_queue()
         continue;
       }
       publish_message(message_ptr);
-      progress_bar_->print_running_status(clock_->now());
+      print_running_status();
     }
     message_queue_.pop();
     message_ptr = peek_next_message_from_queue();
@@ -1551,6 +1569,36 @@ const rosbag2_storage::StorageOptions & PlayerImpl::get_storage_options()
 const rosbag2_transport::PlayOptions & PlayerImpl::get_play_options()
 {
   return play_options_;
+}
+
+inline void PlayerImpl::print_status(const char status) const
+{
+  double current_time_secs = RCUTILS_NS_TO_S(static_cast<double>(clock_->now()));
+  double progress_secs = current_time_secs - starting_time_secs_;
+  printf(" Bag Time %13.6f  Duration %.6f/%.6f [%c] \r",
+    current_time_secs, progress_secs, duration_secs_, status);
+  fflush(stdout);
+}
+
+inline void PlayerImpl::print_running_status() const
+{
+  if (!disable_progress_bar_) {
+    print_status('R');
+  }
+}
+
+inline void PlayerImpl::print_paused_status() const
+{
+  if (!disable_progress_bar_) {
+    print_status('P');
+  }
+}
+
+inline void PlayerImpl::print_delayed_status() const
+{
+  if (!disable_progress_bar_) {
+    print_status('D');
+  }
 }
 
 ///////////////////////////////
