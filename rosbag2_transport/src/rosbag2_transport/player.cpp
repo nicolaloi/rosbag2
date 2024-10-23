@@ -298,7 +298,9 @@ private:
   void configure_play_until_timestamp();
   bool shall_stop_at_timestamp(const rcutils_time_point_value_t & msg_timestamp) const;
 
-  void print_status(const char status) const;
+  template<char status>
+  void print_status() const;
+  void check_and_print_status() const;
   void print_running_status() const;
   void print_paused_status() const;
   void print_delayed_status() const;
@@ -630,11 +632,7 @@ void PlayerImpl::stop()
       playback_thread_.join();
     }
   }
-  if (clock_->is_paused()) {
-    print_paused_status();
-  } else {
-    print_running_status();
-  }
+  check_and_print_status();
 }
 
 void PlayerImpl::pause()
@@ -675,11 +673,7 @@ bool PlayerImpl::set_rate(double rate)
   } else {
     RCLCPP_WARN_STREAM(owner_->get_logger(), "Failed to set rate to invalid value " << rate);
   }
-  if (clock_->is_paused()) {
-    print_paused_status();
-  } else {
-    print_running_status();
-  }
+  check_and_print_status();
   return ok;
 }
 
@@ -1571,8 +1565,11 @@ const rosbag2_transport::PlayOptions & PlayerImpl::get_play_options()
   return play_options_;
 }
 
-inline void PlayerImpl::print_status(const char status) const
+template<char status>
+void PlayerImpl::print_status() const
 {
+  static_assert(status == 'R' || status == 'P' || status == 'D',
+    "Invalid status character");
   double current_time_secs = RCUTILS_NS_TO_S(static_cast<double>(clock_->now()));
   double progress_secs = current_time_secs - starting_time_secs_;
   printf(" Bag Time %13.6f  Duration %.6f/%.6f [%c] \r",
@@ -1580,24 +1577,35 @@ inline void PlayerImpl::print_status(const char status) const
   fflush(stdout);
 }
 
-inline void PlayerImpl::print_running_status() const
+void PlayerImpl::check_and_print_status() const
 {
   if (!disable_progress_bar_) {
-    print_status('R');
+    if (clock_->is_paused()) {
+      print_status<'P'>();
+    } else {
+      print_status<'R'>();
+    }
   }
 }
 
-inline void PlayerImpl::print_paused_status() const
+void PlayerImpl::print_running_status() const
 {
   if (!disable_progress_bar_) {
-    print_status('P');
+    print_status<'R'>();
   }
 }
 
-inline void PlayerImpl::print_delayed_status() const
+void PlayerImpl::print_paused_status() const
 {
   if (!disable_progress_bar_) {
-    print_status('D');
+    print_status<'P'>();
+  }
+}
+
+void PlayerImpl::print_delayed_status() const
+{
+  if (!disable_progress_bar_) {
+    print_status<'D'>();
   }
 }
 
