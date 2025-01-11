@@ -132,13 +132,12 @@ public:
   virtual bool set_rate(double);
 
   /// \brief Playing next message from queue when in pause.
-  /// \param in_burst_mode If true, it will not call the progress bar update to avoid delays.
   /// \details This is blocking call and it will wait until next available message will be
   /// published or rclcpp context shut down.
   /// \note If internal player queue is starving and storage has not been completely loaded,
   /// this method will wait until new element will be pushed to the queue.
   /// \return true if player in pause mode and successfully played next message, otherwise false.
-  virtual bool play_next(bool in_burst_mode = false);
+  virtual bool play_next();
 
   /// \brief Burst the next \p num_messages messages from the queue when paused.
   /// \param num_messages The number of messages to burst from the queue. Specifying zero means no
@@ -796,6 +795,7 @@ void PlayerImpl::toggle_paused()
 {
   // Note: Use upper level public API from owner class to facilitate unit tests
   owner_->is_paused() ? owner_->resume() : owner_->pause();
+  update_progress_bar(owner_->is_paused() ? PlayerStatus::PAUSED : PlayerStatus::RUNNING);
 }
 
 bool PlayerImpl::is_paused() const
@@ -838,7 +838,7 @@ rosbag2_storage::SerializedBagMessageSharedPtr PlayerImpl::take_next_message_fro
   return message_queue_.take().value_or(nullptr);
 }
 
-bool PlayerImpl::play_next(bool is_burst_mode)
+bool PlayerImpl::play_next()
 {
   if (!is_in_playback_) {
     RCLCPP_WARN_STREAM(owner_->get_logger(), "Called play next, but player is not playing.");
@@ -870,11 +870,6 @@ bool PlayerImpl::play_next(bool is_burst_mode)
   finished_play_next_ = false;
   finished_play_next_cv_.wait(lk, [this] {return finished_play_next_.load();});
   play_next_ = false;
-
-  if (!is_burst_mode) {
-    update_progress_bar(clock_->is_paused() ? PlayerStatus::PAUSED : PlayerStatus::RUNNING);
-  }
-
   return play_next_result_.exchange(false);
 }
 
@@ -890,7 +885,7 @@ size_t PlayerImpl::burst(const size_t num_messages)
   uint64_t messages_played = 0;
 
   for (auto ii = 0u; ii < num_messages || num_messages == 0; ++ii) {
-    if (play_next(true)) {
+    if (play_next()) {
       ++messages_played;
     } else {
       break;
@@ -1155,12 +1150,10 @@ void PlayerImpl::play_messages_from_queue()
             play_next_result_ = true;
             finished_play_next_cv_.notify_all();
           }
-        } else {
-          // update_progress_bar_check_rate in this code section is protected
-          // by the mutex skip_message_in_main_play_loop_mutex_.
-          update_progress_bar_check_rate(
-             message_ptr->recv_timestamp, PlayerStatus::RUNNING);
         }
+        // update_progress_bar_check_rate in this code section is protected
+        // by the mutex skip_message_in_main_play_loop_mutex_.
+        update_progress_bar_check_rate(message_ptr->recv_timestamp, PlayerStatus::RUNNING);
       }
       message_ptr = take_next_message_from_queue();
     }
